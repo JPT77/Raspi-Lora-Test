@@ -1,0 +1,6 @@
+LoRaRF>=1.4.0
+# Drop-in-Ersatz fuer RPi.GPIO, funktioniert auf Raspberry Pi 5 (Bookworm)
+# und ohne sudo (User in Gruppe "gpio" und "spi"). LoRaRF importiert
+# intern "RPi.GPIO", rpi-lgpio stellt exakt dieselbe API bereit,
+# nutzt aber /dev/gpiochip* via lgpio.
+rpi-lgpio>=0.6
