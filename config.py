@@ -49,4 +49,4 @@ CODING_RATE = 6                # 4/6  -> LoRaRF: 5=4/5, 6=4/6, 7=4/7, 8=4/8
 PREAMBLE_LENGTH = 8
 CRC_ON = True
 HEADER_EXPLICIT = True         # explicit header
-SYNC_WORD = 0x3444             # Public LoRaWAN sync = 0x3444, privat = 0x1424
+SYNC_WORD = 0x1424             # Public LoRaWAN sync = 0x3444, privat = 0x1424

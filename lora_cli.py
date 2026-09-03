@@ -139,11 +139,11 @@ def build_radio(args) -> SX126x:
     header_type = lora.HEADER_EXPLICIT if cfg.HEADER_EXPLICIT else lora.HEADER_IMPLICIT
     lora.setLoRaPacket(header_type, cfg.PREAMBLE_LENGTH, 255, cfg.CRC_ON)
 
-    lora.setSyncWord(cfg.SYNC_WORD)
+    lora.setSyncWord(args.syncword)
 
     print("[init] freq={} Hz  SF={}  BW={} Hz  CR=4/{}  preamble={}  CRC={}  sync=0x{:04X}  power={} dBm"
           .format(args.freq, args.sf, args.bw, args.cr,
-                  cfg.PREAMBLE_LENGTH, cfg.CRC_ON, cfg.SYNC_WORD, args.power))
+                  cfg.PREAMBLE_LENGTH, cfg.CRC_ON, args.syncword, args.power))
     return lora
 
 
@@ -186,115 +186,166 @@ def run_diag(lora: SX126x) -> None:
 
 def send_message(lora: SX126x, message: bytes, tx_timeout_s: float = 10.0,
                  trace: bool = False) -> bool:
-    """Sendet ein einzelnes LoRa-Paket.
-
-    Wichtig: Wechsel RX_CONTINUOUS -> TX braucht ein explizites standby(),
-    sonst startet die TX-Statemachine u.U. nicht sauber und wait() haengt
-    fuer immer.
+#    ""Sendet ein einzelnes LoRa-Paket.
+#
+#    Wichtig: Wechsel RX_CONTINUOUS -> TX braucht ein explizites standby(),
+#    sonst startet die TX-Statemachine u.U. nicht sauber und wait() haengt
+#    fuer immer.
+    """Sendet ein einzelnes LoRa-Paket per SPI-Polling (kein DIO1 noetig).
 
     Returns True bei TX done, False bei Timeout.
     """
+
     now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{now}] TX ({len(message)} B): {message!r}")
 
-    # sauber in Standby, RXEN aus, dann senden
+    # sauber in Standby, RXEN aus, IRQ-Register loeschen
     lora.standby()
     rxen_set(False)
+    lora.clearIrqStatus(0x03FF)
 
     lora.beginPacket()
     lora.write(list(message), len(message))
     lora.endPacket()
 
-    if trace:
-        # Live-Poll des Chip-Modus: zeigt, ob der Chip ueberhaupt in TX gegangen ist
-        t0 = time.time()
-        last_dump = 0.0
-        while (time.time() - t0) < tx_timeout_s:
+
+    t0 = time.time()
+    last_dump = 0.0
+    while (time.time() - t0) < tx_timeout_s:
+        irq = lora.getIrqStatus()
+        if trace and (time.time() - last_dump) > 0.25:
             st = lora.getStatus()
-            irq = lora.getIrqStatus()
-            mode = (st >> 4) & 0x07   # 0x2=STBY_RC 0x3=STBY_XOSC 0x4=FS 0x5=RX 0x6=TX
+            mode = (st >> 4) & 0x07
             mode_name = {0x2: "STBY_RC", 0x3: "STBY_XOSC", 0x4: "FS",
                          0x5: "RX", 0x6: "TX"}.get(mode, f"0x{mode:X}")
-            if (time.time() - last_dump) > 0.25:
-                print(f"    [trace] t+{time.time()-t0:5.2f}s  status=0x{st:02X} "
-                      f"mode={mode_name}  irq=0x{irq:04X}  BUSY-via-SPI-ok")
-                last_dump = time.time()
-            if irq & 0x0001:  # IRQ_TX_DONE
-                print(f"    [trace] TX_DONE gesetzt (irq=0x{irq:04X})")
-                lora.clearIrqStatus(0x03FF)
-                return True
-            if irq & 0x0200:  # IRQ_TIMEOUT
-                print(f"    [trace] TX_TIMEOUT gesetzt (irq=0x{irq:04X})")
-                lora.clearIrqStatus(0x03FF)
-                return False
-            time.sleep(0.05)
-        print(f"    [trace] Zeit abgelaufen ohne TX_DONE oder TIMEOUT-IRQ.")
-        return False
+            print(f"    [trace] t+{time.time()-t0:5.2f}s  status=0x{st:02X} "
+                  f"mode={mode_name}  irq=0x{irq:04X}")
+            last_dump = time.time()
+        if irq & 0x0001:  # IRQ_TX_DONE
+            lora.clearIrqStatus(0x03FF)
+            now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            toa = (time.time() - t0) * 1000
+            print(f"[{now}] TX done  (~{toa:.1f} ms)")
+            return True
+        if irq & 0x0200:  # IRQ_TIMEOUT
+            lora.clearIrqStatus(0x03FF)
+            print(f"[{now}] TX TIMEOUT gemeldet vom Chip.")
+            return False
+        time.sleep(0.02)
 
-    ok = lora.wait(timeout=tx_timeout_s)  # LoRaRF-timeout ist in SEKUNDEN
-    now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    if ok:
-        print(f"[{now}] TX done  time-on-air ~ {lora.transmitTime():.1f} ms")
-    else:
-        print(f"[{now}] TX TIMEOUT nach {tx_timeout_s:.1f}s (kein TX_DONE-IRQ). "
-              f"DIO1 verkabelt? Modul in korrektem State?")
-    return ok
-
-    print(f"[{now}] TX done  time-on-air ~ {lora.transmitTime():.1f} ms")
+    print(f"[{now}] TX TIMEOUT nach {tx_timeout_s:.1f}s (kein TX_DONE / kein Chip-Timeout).")
+    return False
 
 
-def start_rx_continuous(lora: SX126x) -> None:
-    """Setzt das Modul in kontinuierlichen Empfang und aktiviert RXEN."""
-    lora.standby()
-    rxen_set(True)   # RX-Frontend-LNA an
-    lora.request(lora.RX_CONTINUOUS)
+# SX126x IRQ Bits
+_IRQ_TX_DONE = 0x0001
+_IRQ_RX_DONE = 0x0002
+_IRQ_PREAMBLE_DETECTED = 0x0004
+_IRQ_SYNC_WORD_VALID = 0x0008
+_IRQ_HEADER_VALID = 0x0010
+_IRQ_HEADER_ERR = 0x0020
+_IRQ_CRC_ERR = 0x0040
+_IRQ_TIMEOUT = 0x0200
+
+_IRQ_NAMES = [
+    (0x0001, "TX_DONE"),
+    (0x0002, "RX_DONE"),
+    (0x0004, "PREAMBLE"),
+    (0x0008, "SYNC_VALID"),
+    (0x0010, "HDR_VALID"),
+    (0x0020, "HDR_ERR"),
+    (0x0040, "CRC_ERR"),
+    (0x0200, "TIMEOUT"),
+]
 
 
-def try_read_packet(lora: SX126x, show_errors: bool) -> None:
-    """Prueft, ob ein Paket empfangen wurde und gibt es aus.
+def _decode_irq(irq: int) -> str:
+    parts = [name for bit, name in _IRQ_NAMES if irq & bit]
+    return "+".join(parts) if parts else "-"
 
-    LoRaRF feuert die RX-IRQ auch bei HEADER_ERR und CRC_ERR. Solche
-    "Pakete" sind reine Rauschtrigger und werden per Default unterdrueckt.
+
+def start_rx_continuous(lora: SX126x, sniff: bool = False) -> None:
+    """Setzt das Modul in kontinuierlichen Empfang - ohne LoRaRF-IRQ-Callbacks.
+
+    Wir umgehen lora.request() bewusst, damit LoRaRF nicht versucht,
+    add_event_detect() auf DIO1 zu registrieren (funktioniert mit
+    rpi-lgpio unzuverlaessig). Stattdessen konfigurieren wir DIO1 nur als
+    IRQ-Quelle im Chip und pollen getIrqStatus() per SPI.
+    Im Sniff-Modus werden alle relevanten IRQs aktiviert, damit man auch
+    Preamble-/Sync-Trigger sieht (Diagnose bei Sync-Word-Mismatch etc.).
     """
-    if not lora.available():
+    lora.standby()
+    rxen_set(True)                  # RX-Frontend-LNA an
+    lora.clearIrqStatus(0x03FF)
+    # DIO1 als IRQ fuer RX_DONE / HEADER_ERR / CRC_ERR / TIMEOUT (Chip-intern,
+    # wir lesen es aber per SPI aus, nicht ueber DIO1-GPIO)
+    if sniff:
+        irq_mask = (_IRQ_RX_DONE | _IRQ_PREAMBLE_DETECTED | _IRQ_SYNC_WORD_VALID
+                    | _IRQ_HEADER_VALID | _IRQ_HEADER_ERR | _IRQ_CRC_ERR | _IRQ_TIMEOUT)
+    else:
+        irq_mask = _IRQ_RX_DONE | _IRQ_HEADER_ERR | _IRQ_CRC_ERR | _IRQ_TIMEOUT
+    lora.setDioIrqParams(irq_mask, irq_mask, 0x0000, 0x0000)
+    # RX continuous mode
+    lora.setRx(0xFFFFFF)
+
+
+def poll_rx(lora: SX126x, show_errors: bool, sniff: bool = False) -> None:
+    """Prueft per SPI, ob ein RX-Ereignis vorliegt, und liest ggf. das Paket.
+    Wird von der Main-Loop alle paar ms aufgerufen. Keine GPIO-Interrupts.
+    """
+    irq = lora.getIrqStatus()
+    if irq == 0x0000:
         return
-
-    # Erst Status pruefen (LoRaRF loescht ihn beim naechsten wait()-Zyklus)
-    status = lora.status()
-
-    length = lora.available()
-    payload = bytearray()
-    while lora.available():
-        payload.append(lora.read())
 
     now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
-    # Fehlerhafte Pakete (Header-/CRC-Error) sind meistens Rauschen
-    if status in (lora.STATUS_HEADER_ERR, lora.STATUS_CRC_ERR):
-        if show_errors:
-            print(f"[{now}] RX-ERR ({length} B) status=0x{status:02X} "
-                  f"({'HEADER_ERR' if status == lora.STATUS_HEADER_ERR else 'CRC_ERR'}) "
-                  f"RSSI={lora.packetRssi()} dBm SNR={lora.snr()} dB  -- vermutlich Rauschen")
+    # Wenn ein RX_DONE dabei ist -> normale Verarbeitung + Buffer lesen
+    if irq & _IRQ_RX_DONE:
+        length, offset = lora.getRxBufferStatus()
+        payload = bytes(lora.readBuffer(offset, length)) if length else b""
+        rssi = lora.packetRssi()
+        snr = lora.snr()
+        # IRQ-Register loeschen, damit naechste RX-Aktion sauber startet
+        lora.clearIrqStatus(0x03FF)
+
+        try:
+            text = payload.decode("utf-8")
+            printable = all(32 <= b < 127 or b in (9, 10, 13) for b in payload)
+        except UnicodeDecodeError:
+            text = ""
+            printable = False
+        hex_dump = " ".join(f"{b:02X}" for b in payload)
+
+        crc_ok = not (irq & _IRQ_CRC_ERR)
+        hdr_ok = not (irq & _IRQ_HEADER_ERR)
+        tag = "RX" if crc_ok and hdr_ok else "RX-BAD"
+        print(f"\n[{now}] {tag} ({length} B)  RSSI={rssi} dBm  SNR={snr} dB  irq=0x{irq:04X} [{_decode_irq(irq)}]")
+        print(f"        hex : {hex_dump}")
+        if printable and text:
+            print(f"        text: {text}")
+
         return
 
-    rssi = lora.packetRssi()
-    snr = lora.snr()
-
-    # Als Text darstellen wenn druckbar, sonst als hex
-    try:
-        text = payload.decode("utf-8")
-        printable = all(32 <= b < 127 or b in (9, 10, 13) for b in payload)
-    except UnicodeDecodeError:
-        text = ""
-        printable = False
-
-    hex_dump = " ".join(f"{b:02X}" for b in payload)
-
-    print(f"\
-[{now}] RX ({length} B)  RSSI={rssi} dBm  SNR={snr} dB  status=0x{status:02X}")
-    print(f"        hex : {hex_dump}")
-    if printable and text:
-        print(f"        text: {text}")
+    # Kein RX_DONE - Sub-Events (Preamble, Sync, HeaderErr, CrcErr, Timeout)
+    if sniff or show_errors:
+        # bei HeaderErr / CrcErr kann trotzdem was im Buffer stehen -> hex dumpen
+        extra = ""
+        if irq & (_IRQ_HEADER_ERR | _IRQ_CRC_ERR):
+            try:
+                length, offset = lora.getRxBufferStatus()
+                if length:
+                    payload = bytes(lora.readBuffer(offset, length))
+                    extra = "  hex=" + " ".join(f"{b:02X}" for b in payload)
+            except Exception:  # noqa: BLE001
+                pass
+            rssi = lora.packetRssi()
+            snr = lora.snr()
+            print(f"[{now}] RX-ERR irq=0x{irq:04X} [{_decode_irq(irq)}]  RSSI={rssi} dBm  SNR={snr} dB{extra}")
+        elif sniff:
+            # nur Preamble / Sync / HdrValid -> nur kurz melden, ohne Buffer
+            rssi = lora.rssiInst()
+            print(f"[{now}] sniff irq=0x{irq:04X} [{_decode_irq(irq)}]  RSSI(inst)={rssi} dBm")
+        lora.clearIrqStatus(0x03FF)
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +360,35 @@ def _handle_sigint(signum, frame):
     _stop = True
     print("\
 [main] Abbruch angefordert...")
+
+
+def send_burst(lora: SX126x, message: bytes, repeat: int, interval_s: float,
+               tx_timeout_s: float, trace: bool, show_errors: bool, sniff: bool) -> None:
+    """Sendet die Nachricht mehrmals im Abstand von interval_s Sekunden.
+
+    Zwischen den Aussendungen wird das Modul wieder in RX_CONTINUOUS gesetzt
+    und dort weiter gepollt, so dass Empfangsereignisse und Ctrl-C sichtbar
+    bleiben. Praktisch, um mit dem RTL-SDR bei 868 MHz zu sehen, ob wirklich
+    gesendet wird.
+    """
+    for i in range(repeat):
+        if _stop:
+            break
+        if repeat > 1:
+            print(f"[burst] {i + 1}/{repeat}")
+        send_message(lora, message, tx_timeout_s, trace=trace)
+
+        if i == repeat - 1 or _stop:
+            break
+
+        # zurueck in RX_CONTINUOUS und interval_s abwarten, dabei RX pollen
+        start_rx_continuous(lora, sniff=sniff)
+        t_end = time.time() + interval_s
+        print(f"[burst] warte {interval_s:.1f}s bis zur naechsten Wiederholung "
+              f"(RX bleibt aktiv)")
+        while time.time() < t_end and not _stop:
+            poll_rx(lora, show_errors, sniff=sniff)
+            time.sleep(0.02)
 
 
 def main() -> int:
@@ -328,13 +408,17 @@ def main() -> int:
     parser.add_argument("--tx-only", type=str, default=None,
                         help="Einmalig senden und danach beenden (kein RX).")
     parser.add_argument("--show-errors", action="store_true",
-                        help="Auch Rauschtrigger mit Header-/CRC-Fehler anzeigen.")
+                        help="Auch Rauschtrigger mit Header-/CRC-Fehler anzeigen (mit Buffer-Dump).")
+    parser.add_argument("--sniff", action="store_true",
+                        help="Sniff-Modus: alle RX-IRQs auflisten (Preamble, Sync, HdrValid, "
+                             "HdrErr, CrcErr, RxDone) - inkl. Buffer-Hex bei jedem Trigger.")
     parser.add_argument("--tx-timeout", type=float, default=10.0,
                         help="TX-Timeout in Sekunden (default 10).")
-    parser.add_argument("--no-irq", action="store_true",
-                        help="DIO1 nicht als GPIO-Interrupt verwenden. LoRaRF pollt "
-                             "stattdessen die IRQ-Register per SPI. Diagnose-Modus, "
-                             "wenn TX/RX-Done nie ankommt.")
+    parser.add_argument("--no-irq", action="store_true", default=True,
+                        help="[Default] DIO1 nicht als GPIO-Interrupt verwenden - "
+                             "es wird durchgehend per SPI gepollt. Zuverlaessig auf Pi 5 / rpi-lgpio.")
+    parser.add_argument("--use-irq", dest="no_irq", action="store_false",
+                        help="DIO1 als GPIO-Interrupt registrieren (nicht empfohlen).")
     parser.add_argument("--diag", action="store_true",
                         help="Vor dem Start Chip-Diagnose ausgeben (Status/IRQ/DIO1).")
     parser.add_argument("--chip", choices=["sx1261", "sx1262"], default=cfg.CHIP_VARIANT,
@@ -347,6 +431,15 @@ def main() -> int:
                         help="TCXO-Konfiguration explizit einschalten.")
     parser.add_argument("--trace-tx", action="store_true",
                         help="Waehrend TX den Chip-Modus alle 250ms per SPI pollen und ausgeben.")
+    parser.add_argument("--repeat", type=int, default=5,
+                        help="Wie oft eine TX-Nachricht wiederholt wird (default 5). "
+                             "Praktisch fuer RTL-SDR-Beobachtung.")
+    parser.add_argument("--repeat-interval", type=float, default=10.0,
+                        help="Sekunden zwischen den Wiederholungen (default 10).")
+    parser.add_argument("--syncword", type=lambda s: int(s, 0), default=cfg.SYNC_WORD,
+                        help=f"LoRa Sync-Word (default 0x{cfg.SYNC_WORD:04X}). "
+                             "Typische Werte: 0x1424 (RadioLib/ESPHome private), "
+                             "0x3444 (public/LoRaWAN).")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _handle_sigint)
@@ -363,23 +456,29 @@ def main() -> int:
 
     # --- TX-only Modus ---
     if args.tx_only is not None:
-        send_message(lora, args.tx_only.encode("utf-8"), args.tx_timeout, trace=args.trace_tx)
+        send_burst(lora, args.tx_only.encode("utf-8"),
+                   repeat=args.repeat, interval_s=args.repeat_interval,
+                   tx_timeout_s=args.tx_timeout, trace=args.trace_tx,
+                   show_errors=args.show_errors, sniff=args.sniff)
         lora.end()
         return 0
 
-    # --- Optional einmalig senden vor RX ---
+    # --- Optional Burst vor RX ---
     if args.send is not None:
-        send_message(lora, args.send.encode("utf-8"), args.tx_timeout, trace=args.trace_tx)
+        send_burst(lora, args.send.encode("utf-8"),
+                   repeat=args.repeat, interval_s=args.repeat_interval,
+                   tx_timeout_s=args.tx_timeout, trace=args.trace_tx,
+                   show_errors=args.show_errors, sniff=args.sniff)
 
     print("[main] gehe in RX_CONTINUOUS. Tippe Text + ENTER zum Senden. Ctrl-C zum Beenden.")
-    start_rx_continuous(lora)
-
+    start_rx_continuous(lora, sniff=args.sniff)
     stdin_is_tty = sys.stdin.isatty()
 
     try:
         while not _stop:
             # 1) empfangenes Paket abholen
-            try_read_packet(lora, args.show_errors)
+            #try_read_packet(lora, args.show_errors)
+            poll_rx(lora, args.show_errors, sniff=args.sniff)
 
             # 2) stdin nicht-blockierend pruefen
             if stdin_is_tty:
